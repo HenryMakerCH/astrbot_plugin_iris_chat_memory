@@ -517,7 +517,13 @@ async def _collect_user_profile(
     group_manager = GroupProfileManager(profile_storage)
     user_manager = UserProfileManager(profile_storage)
 
-    group_profile = await group_manager.get_or_create(group_id, persona_id)
+    # 私聊 / WebChat 没有群号（GenericAdapter.get_group_id 返回 ""），
+    # 用空字符串去 get_or_create 会落到「空群桶」：所有私聊共用同一份群画像
+    # （群名 / 服务器环境 / 物流单号 / 预算…），再按【群聊】注入到每一轮私聊。
+    # 私聊只注入【发送者】画像。
+    group_profile = (
+        await group_manager.get_or_create(group_id, persona_id) if group_id else None
+    )
     user_profile = await user_manager.get_or_create(
         user_id, effective_group_id, persona_id
     )
@@ -857,14 +863,14 @@ def _extract_kg_keywords(text: str) -> List[str]:
 
 
 def _format_profiles_for_injection(
-    group_profile: "GroupProfile", user_profile: "UserProfile"
+    group_profile: "GroupProfile | None", user_profile: "UserProfile"
 ) -> str:
     """格式化画像为注入文本
 
     将用户画像和群聊画像分开显示，节约 token。
 
     Args:
-        group_profile: 群聊画像对象
+        group_profile: 群聊画像对象；私聊 / WebChat 无群号时传 None，只注入【发送者】
         user_profile: 用户画像对象
 
     Returns:
@@ -918,16 +924,16 @@ def _format_profiles_for_injection(
     if len(user_parts) > 1:
         sections.append("\n".join(user_parts))
 
-    group_parts = ["【群聊】"]
-    if group_profile.interests:
+    group_parts = ["【群聊】"] if group_profile else []
+    if group_profile and group_profile.interests:
         group_parts.append(f"兴趣: {', '.join(group_profile.interests)}")
-    if group_profile.atmosphere_tags:
+    if group_profile and group_profile.atmosphere_tags:
         group_parts.append(f"氛围: {', '.join(group_profile.atmosphere_tags)}")
-    if group_profile.long_term_tags:
+    if group_profile and group_profile.long_term_tags:
         group_parts.append(f"核心特征: {', '.join(group_profile.long_term_tags)}")
-    if group_profile.blacklist_topics:
+    if group_profile and group_profile.blacklist_topics:
         group_parts.append(f"禁忌: {', '.join(group_profile.blacklist_topics)}")
-    if group_profile.custom_fields:
+    if group_profile and group_profile.custom_fields:
         custom_str = ", ".join(
             f"{k}: {v}" for k, v in group_profile.custom_fields.items()
         )
