@@ -309,6 +309,38 @@ def _get_inline_image_desc(
     return f" [图:{parts}]"
 
 
+def _norm_ctx_text(text: object) -> str:
+    """把消息正文压成指纹：折叠空白 + 取前 80 字符。"""
+    return " ".join(str(text or "").split())[:80]
+
+
+def _context_fingerprints(req: "ProviderRequest") -> set:
+    """收集本轮请求里已有原生长对话的 (role, 正文指纹) 集合。
+
+    私聊保留原生上下文后，L1 回顾文本会和真实轮次重复注入同一段对话；
+    这里给出指纹用于去重，群聊场景 req.contexts 为空，集合为空，行为不变。
+    """
+    prints = set()
+    try:
+        contexts = getattr(req, "contexts", None) or []
+    except Exception:
+        return prints
+    for ctx in contexts:
+        try:
+            role = ctx.get("role") if isinstance(ctx, dict) else None
+            content = ctx.get("content") if isinstance(ctx, dict) else None
+            if isinstance(content, list):
+                content = " ".join(
+                    str(part.get("text") or "")
+                    for part in content
+                    if isinstance(part, dict)
+                )
+            prints.add((role, _norm_ctx_text(content)))
+        except Exception:
+            continue
+    return prints
+
+
 async def _collect_l1_context(
     event: "AstrMessageEvent",
     req: "ProviderRequest",
@@ -367,6 +399,26 @@ async def _collect_l1_context(
     if not messages:
         logger.debug(f"群聊 {group_id} 排除当前消息后 L1 上下文为空，跳过注入")
         return ""
+
+    # 私聊保留了原生上下文时，L1 回顾里与之一致的轮次不再重复注入，
+    # 只补原生窗口之外（更早）的对话。
+    if req is not None and getattr(req, "contexts", None):
+        native = _context_fingerprints(req)
+        if native:
+            before = len(messages)
+            messages = [
+                m
+                for m in messages
+                if (m.role, _norm_ctx_text(m.content)) not in native
+            ]
+            if len(messages) != before:
+                logger.debug(
+                    f"L1 回顾去重：{before} → {len(messages)} 条（已有原生上下文 "
+                    f"{len(native)} 条）"
+                )
+            if not messages:
+                logger.debug("L1 回顾全部已被原生上下文覆盖，跳过注入")
+                return ""
 
     max_content_chars = cast(int, config.get("l1_inject_max_content_chars"))
 
