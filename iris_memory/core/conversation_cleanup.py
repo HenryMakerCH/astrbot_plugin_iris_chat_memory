@@ -31,6 +31,18 @@ if TYPE_CHECKING:
 
 logger = get_logger("conversation_cleanup")
 
+# 私聊保留真实上下文的条数（可在 hidden_config.json 用 private_context_keep 覆盖）。
+# 0 = 恢复旧行为（私聊也全清）。
+_DEFAULT_PRIVATE_CONTEXT_KEEP = 16
+
+
+def _is_private_event(event: "AstrMessageEvent") -> bool:
+    """判断事件是否为私聊；任何异常都按非私聊处理（保守：照旧清空）。"""
+    try:
+        return bool(event.is_private_chat())
+    except Exception:
+        return False
+
 
 async def handle_pre_request_cleanup(
     event: "AstrMessageEvent",
@@ -39,6 +51,9 @@ async def handle_pre_request_cleanup(
     component_manager: "ComponentManager",
 ) -> None:
     """LLM 请求前的对话上下文清理（默认策略）
+    私聊（FriendMessage）默认保留最近 private_context_keep（默认 16）条真实轮次，
+    只有群聊全清；把 private_context_keep 设为 0 可恢复旧行为。
+
 
     在 LLM 请求前清空 req.contexts，确保 Agent 不会使用 AstrBot 内置
     对话历史，上下文完全由本插件的 L1/L2/L3 系统通过
@@ -68,11 +83,27 @@ async def handle_pre_request_cleanup(
     try:
         ctx_count = len(req.contexts) if req.contexts else 0
         if ctx_count > 0:
-            req.contexts = []
-            logger.debug(
-                f"已清空会话 {event.unified_msg_origin} 的内置上下文 "
-                f"({ctx_count} 条历史消息)，改由 L1/L2/L3 记忆系统提供上下文"
-            )
+            keep = 0
+            if _is_private_event(event):
+                try:
+                    keep = int(config.get("private_context_keep", _DEFAULT_PRIVATE_CONTEXT_KEEP))
+                except (TypeError, ValueError):
+                    keep = _DEFAULT_PRIVATE_CONTEXT_KEEP
+            if keep > 0:
+                # 私聊保留最近若干条真实对话轮次：扁平化的 L1 文本无法替代
+                # 真正的 user/assistant 轮次，全清会导致模型每轮都像新开一个上下文。
+                # 群聊仍全部清空（群消息量大，逐条保留成本不可控）。
+                req.contexts = list(req.contexts)[-keep:]
+                logger.debug(
+                    f"私聊会话 {event.unified_msg_origin} 保留最近 "
+                    f"{len(req.contexts)}/{ctx_count} 条内置上下文"
+                )
+            else:
+                req.contexts = []
+                logger.debug(
+                    f"已清空会话 {event.unified_msg_origin} 的内置上下文 "
+                    f"({ctx_count} 条历史消息)，改由 L1/L2/L3 记忆系统提供上下文"
+                )
     except Exception as e:
         logger.warning(f"清空内置上下文失败: {e}")
 
